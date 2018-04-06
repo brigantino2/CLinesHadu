@@ -1,21 +1,19 @@
 import types
 import weakref
-from functools import partial
 
-from PyQt4 import QtGui
-from PyQt4 import QtCore
-from PyQt4.QtCore import QTimer
+from PyQt4 import QtCore, QtGui
 
 
-## The following code is borrowed from here:
+# The following code has been borrowed here:
 # http://stackoverflow.com/questions/24689800/async-like-pattern-in-pyqt-or-cleaner-background-call-pattern
 # It provides a child->parent thread-communication mechanism.
 
 
 class ref(object):
+
+    """A weak method implementation
     """
-    A weak method implementation
-    """
+
     def __init__(self, method):
         try:
             if method.im_self is not None:
@@ -33,8 +31,7 @@ class ref(object):
             self._class = None
 
     def __call__(self):
-        """
-        Return a new bound-method like the original, or the
+        """Return a new bound-method like the original, or the
         original function if refers just to a function or unbound
         method.
         Returns None if the original object doesn't exist
@@ -66,6 +63,7 @@ class ref(object):
 
 
 class proxy(ref):
+
     """
     Exactly like ref, but calling it will cause the referent method to
     be called with the same arguments. If the referent's object no longer lives,
@@ -99,8 +97,8 @@ class proxy(ref):
 
 
 class CallbackEvent(QtCore.QEvent):
-    """
-    A custom QEvent that contains a callback reference
+
+    """A custom QEvent that contains a callback reference.
 
     Also provides class methods for conveniently executing
     arbitrary callback, to be dispatched to the event loop.
@@ -142,116 +140,3 @@ class CallbackEvent(QtCore.QEvent):
 
         # post the event to the given receiver
         QtGui.QApplication.postEvent(receiver, event)
-
-## End borrowed code
-
-
-## Begin Coroutine-framework code
-class AsyncTask(QtCore.QObject):
-    """ Object used to manage asynchronous tasks.
-
-    This object should wrap any function that you want
-    to call asynchronously. It will launch the function
-    in a new thread, and register a listener so that
-    `on_finished` is called when the thread is complete.
-
-    """
-    def __init__(self, func, finished_callback=None, *args, **kwargs):
-        super(AsyncTask, self).__init__()
-        self.result = None  # Used for the result of the thread.
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-        self.finished = False
-        self.finished_cb_ran = False
-        self.finished_callback = finished_callback
-        self.objThread = RunThreadCallback(self, self.func, self.on_finished,
-                                           *self.args, **self.kwargs)
-        self.objThread.start()
-
-    def customEvent(self, event):
-        event.callback()
-
-    def on_finished(self, result):
-        """ Called when the threaded operation is complete.
-
-        Saves the result of the thread, and
-        executes finished_callback with the result if one
-        exists. Also closes/cleans up the thread.
-
-        """
-        self.finished = True
-        self.result = result
-        if self.finished_callback:
-            self.finished_ran = True
-            func = partial(self.finished_callback, result)
-            QTimer.singleShot(0, func)
-        self.objThread.quit()
-        self.objThread.wait()
-
-
-class RunThreadCallback(QtCore.QThread):
-    """ Runs a function in a thread, and alerts the parent when done.
-
-    Uses a custom QEvent to alert the main thread of completion.
-
-    """
-    def __init__(self, parent, func, on_finish, *args, **kwargs):
-        super(RunThreadCallback, self).__init__(parent)
-        self.on_finished = on_finish
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-
-    def run(self):
-        result = self.func(*self.args, **self.kwargs)
-        try:
-            result = self.func(*self.args, **self.kwargs)
-        except Exception as e:
-            print "e is %s" % e
-            result = str(e)
-        finally:
-            CallbackEvent.post_to(self.parent(), self.on_finished, result)
-
-
-def coroutine(func):
-    """ Coroutine decorator, meant for use with AsyncTask.
-
-    This decorator must be used on any function that uses
-    the `yield AsyncTask(...)` pattern. It shouldn't be used
-    in any other case.
-
-    The decorator will yield AsyncTask objects from the
-    decorated generator function, and register itself to
-    be called when the task is complete. It will also
-    excplicitly call itself if the task is already
-    complete when it yields it.
-
-    """
-    def wrapper(*args, **kwargs):
-        def execute(gen, input=None):
-            if isinstance(gen, types.GeneratorType):
-                if not input:
-                    obj = next(gen)
-                else:
-                    try:
-                        obj = gen.send(input)
-                    except StopIteration as e:
-                        result = getattr(e, "value", None)
-                        return result
-                if isinstance(obj, AsyncTask):
-                    # Tell the thread to call `execute` when its done
-                    # using the current generator object.
-                    func = partial(execute, gen)
-                    obj.finished_callback = func
-                    if obj.finished and not obj.finished_cb_ran:
-                        obj.on_finished(obj.result)
-                else:
-                    raise Exception("Using yield is only supported with AsyncTasks.")
-            else:
-                pass
-        result = func(*args, **kwargs)
-        execute(result)
-    return wrapper
-
-## End coroutine-framework code

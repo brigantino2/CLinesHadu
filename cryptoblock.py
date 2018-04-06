@@ -12,7 +12,15 @@ def Xor(buf):
 
 
 class CryptographicBlock(object):
-    """"""
+
+    """A class that attempts decryption/encryption of cccam server strings.
+
+    This module has been imported from
+    https://github.com/gavazquez/CLineTester
+    and rewritten in an attempt to make it more readable and understandable.
+    Since my knowledge on the subject is basically zero I can't do much
+    to explain what this class does.
+    """
 
     def __init__(self, key, length):
         self._counter = 0
@@ -27,7 +35,7 @@ class CryptographicBlock(object):
                 self._keytable[j], self._keytable[i]
 
     def decrypt(self, data, length):
-        """"""
+        """Applying *magic* to decrypt cccam server response."""
 
         for i in range(0, length):
             self._counter = 0xFF & (self._counter + 1)
@@ -49,7 +57,7 @@ class CryptographicBlock(object):
             self._state = 0xFF & (self._state ^ z)
 
     def encrypt(self, data, length):
-        """"""
+        """Applying more *magic* to encrypt cccam server response."""
 
         for i in range(0, length):
             self._counter = 0xFF & (self._counter + 1)

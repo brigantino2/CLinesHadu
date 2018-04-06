@@ -1,5 +1,5 @@
-import sys
 import re
+import sys
 import time
 import unicodedata
 from collections import defaultdict
@@ -8,8 +8,8 @@ from random import shuffle
 from PyQt4 import QtCore, QtGui
 from PyQt4.QtCore import QThread
 from qtasync import CallbackEvent
-
 from tester import ClineTester
+
 
 try:
     _fromUtf8 = QtCore.QString.fromUtf8
@@ -24,7 +24,8 @@ def slugify(value):
     underscores) and converts spaces to hyphens. Also strips leading and
     trailing whitespace.
     """
-    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    value = unicodedata.normalize('NFKD', value).encode(
+        'ascii', 'ignore').decode('ascii')
     value = re.sub('[^\w\s-]', '', value).strip().lower()
     return re.sub('[-\s]+', '-', value)
 
@@ -32,13 +33,21 @@ def slugify(value):
 # https://stackoverflow.com/questions/24689800/async-like-pattern-in-pyqt-or-cleaner-background-call-pattern
 
 
-class CLineTestThread(QThread):   # NOT WORKING?
-    """ Runs a function in a thread, and alerts the parent when done.
+class CLineTestThread(QThread):
+
+    """Runs a function in a thread, and alerts the parent when done.
 
     Uses a custom QEvent to alert the main thread of completion.
 
+    Args:
+    - parent: the parent (calling) instance to be notified when the function is done executing. In our case a
+              CLinesWindow instance.
+    - func: the function to be executed asynchronously. in our case CLinesWindow.test_cline
+    - end_callback: a function to be executed when the function is done executing
+
     """
-    def __init__(self, parent, func, end_callback, *args, **kwargs):
+
+    def __init__(self, parent, func, end_callback=None, *args, **kwargs):
         super(CLineTestThread, self).__init__(parent)
         self.func = func
         self.end_callback = end_callback
@@ -53,14 +62,15 @@ class CLineTestThread(QThread):   # NOT WORKING?
             print "ERROR: ", e
             result = e
         finally:
-            CallbackEvent.post_to(self.parent(), self.end_callback, result)
+            if self.end_callback:
+                CallbackEvent.post_to(self.parent(), self.end_callback, result)
 
 
 class CLinesWindow(QtGui.QMainWindow):
 
     # regular expression used to find clines in user pasted text
     CLINE_REGEX = '^[Cc]{1}[:]{1}[ \t]+([^ \t]+)[ \t]+([0-9]+)[ \t]+([^ \t]+)[ \t]+([^ \t]+)'
-    TEST_DELAY = 0.5
+    TEST_DELAY = 0.2
 
     def __init__(self):
         QtGui.QMainWindow.__init__(self)
@@ -161,23 +171,82 @@ class CLinesWindow(QtGui.QMainWindow):
 
     def test_cline(self, server_name, port, user, pw, checkbox=None):
         cline = str("C: %s %s %s %s" % (server_name, port, user, pw))
-        is_valid, error_msg = ClineTester(cline).test()
-
         t = checkbox.text()
-        if is_valid:
+
+        tester = ClineTester(cline)
+        error_msg = tester.test()
+
+        if error_msg is None:
+            # SUCCESS!
             checkbox.setChecked(True)
             checkbox.setText("%s  [OK]" % t)
-        else:
-            checkbox.setChecked(False)
-            checkbox.setText("%s  [FAIL: %s]" % (t, error_msg))
+            return True
 
-        return is_valid
+        # Server testing has failed
+        checkbox.setChecked(False)
+        checkbox.setText("%s  [FAILED: %s]" % (t, error_msg))
+        return False
 
     def test_cline_done(self, result):
         # NOT USED
         pass
 
+    def test_cline_async(self, server_name, port, user, pw, checkbox):
+        """Executes self.test_cline asynchronously, using a """
+        CLineTestThread(
+            self,
+            # the method to be asynchronously executed
+            self.test_cline,
+            # method to call when the above is done testing
+            self.test_cline_done,
+            # server data
+            server_name, port, user, pw,
+            # the checkbox, we need it to write the testing result in its label
+            checkbox
+        )
+
+    def generate_checkboxes(self, clines):
+        """Generates a list of checkboxes, one for each recognized CLine.
+
+        The label describes the CLine and shows a message telling if testing on that server was successful or not,
+        once testing (which is asynchronous) is done.
+        """
+        # Grouping clines by server name+port: pasted clines might contain mnay entries for the same server+port
+        # with different usernames and passwords. We want to keep those entries
+        # together.
+        clines_grouped = defaultdict(list)
+        for server_name, port, user, pw in clines:
+            clines_grouped[(server_name, port)].append((user, pw))
+        clines_grouped = dict(clines_grouped)
+
+        checkboxes = []
+
+        if clines_grouped:
+            i = 1
+            for (server_name, port), users_pws in clines_grouped.items():
+                # Shuffling each server+port usernames and passwords list. This is intended to add some variability
+                # if you copy/paste a list of CLines from websites
+                shuffle(users_pws)
+                for j, (user, pw) in enumerate(users_pws):
+
+                    checkbox = QtGui.QCheckBox(
+                        "%s %s %s %s" % (server_name, port, user, pw),
+                        self.stacked_widget
+                    )
+                    checkboxes.append(checkbox)
+                    time.sleep(self.TEST_DELAY)
+
+                    self.test_cline_async(
+                        server_name, port, user, pw, checkbox)
+
+                i += 1
+
+        return checkboxes
+
     def retrieve_clines(self, text):
+        """Parses the text pasted in the textarea, looking for valid CLines, stripping whitespaces, comments and
+        other garbage.
+        """
         clines = []
 
         for line in text.split('\n'):
@@ -189,34 +258,6 @@ class CLinesWindow(QtGui.QMainWindow):
         return sorted(
             clines, key=lambda l: ''.join(l)
         )
-
-    def generate_checkboxes(self, clines):
-        clines_grouped = defaultdict(list)
-        for server_name, port, user, pw in clines:
-            clines_grouped[(server_name, port)].append((user, pw))
-        clines_grouped = dict(clines_grouped)
-
-        checkboxes = []
-
-        if clines_grouped:
-            i = 1
-            for (server_name, port), users_pws in clines_grouped.items():
-                shuffle(users_pws)
-                for j, (user, pw) in enumerate(users_pws):
-
-                    checkbox = QtGui.QCheckBox(
-                        "%s %s %s %s" % (server_name, port, user, pw),
-                        self.stacked_widget
-                    )
-                    checkboxes.append(checkbox)
-                    time.sleep(self.TEST_DELAY)
-                    CLineTestThread(
-                        self, self.test_cline, self.test_cline_done,
-                        server_name, port, user, pw, checkbox
-                    )
-                i += 1
-
-        return checkboxes
 
     def page2(self):
         """List of found CLines, checkboxes to select lines to include.
