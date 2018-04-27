@@ -18,7 +18,7 @@ class InvalidCLine(Exception):
     pass
 
 
-class ClineTester(object):
+class CLineTester(object):
 
     """This class tests a single CLine trying to connect to the indicated CCcam server,
     logging in with the indicated username/password and trying to decrypt its response.
@@ -28,7 +28,7 @@ class ClineTester(object):
              Clines format: "C: <server name> <port> <username> <password>"
 
     Example usage:
-        tester = ClineTester("C: foobar.baz.com 1234 johndoe mypassw")
+        tester = CLineTester("C: foobar.baz.com 1234 johndoe mypassw")
         # Returns None if testing was successful, a user-friendly error message otherwise:
         error = tester.test()
 

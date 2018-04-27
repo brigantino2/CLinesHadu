@@ -1,14 +1,13 @@
 import re
 import sys
-import time
 import unicodedata
 from collections import defaultdict
 from random import shuffle
 
 from PyQt4 import QtCore, QtGui
-from PyQt4.QtCore import QThread
-from qtasync import CallbackEvent
-from tester import ClineTester
+from PyQt4.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+
+from tester import CLineTester
 
 
 try:
@@ -19,58 +18,71 @@ except AttributeError:
 
 
 def slugify(value):
-    """
-    Converts to lowercase, removes non-word characters (alphanumerics and
+    """Converts to lowercase, removes non-word characters (alphanumerics and
     underscores) and converts spaces to hyphens. Also strips leading and
     trailing whitespace.
     """
+
     value = unicodedata.normalize('NFKD', value).encode(
         'ascii', 'ignore').decode('ascii')
     value = re.sub('[^\w\s-]', '', value).strip().lower()
     return re.sub('[-\s]+', '-', value)
 
 
-# https://stackoverflow.com/questions/24689800/async-like-pattern-in-pyqt-or-cleaner-background-call-pattern
+class CLineTestWorkerSignals(QObject):
+    """Defines what signals our thread worker will send.
 
-
-class CLineTestThread(QThread):
-
-    """Runs a function in a thread, and alerts the parent when done.
-
-    Uses a custom QEvent to alert the main thread of completion.
-
-    Args:
-    - parent: the parent (calling) instance to be notified when the function is done executing. In our case a
-              CLinesWindow instance.
-    - func: the function to be executed asynchronously. in our case CLinesWindow.test_cline
-    - end_callback: a function to be executed when the function is done executing
-
+    We just use a
+    - finished: to be set with the cline tuple and an error message (empty string if testing was successful)
+    - error: in case an Exception is raised
     """
 
-    def __init__(self, parent, func, end_callback=None, *args, **kwargs):
-        super(CLineTestThread, self).__init__(parent)
-        self.func = func
-        self.end_callback = end_callback
-        self.args = args
-        self.kwargs = kwargs
-        self.start()
+    finished = pyqtSignal(tuple, str)
+    error = pyqtSignal(object)
+
+
+class CLineTestWorker(QRunnable):
+    """To test clines are working e use a thread pool with a thread worker (a QRunnable) for each server to test.
+
+    This thread worker performs the server testing using CLineTester, then emits a `finished` signal, that will be
+    handled CLinesWindow in the main thread.
+    """
+
+    def __init__(self, server_name, port, user, pw, *args, **kwargs):
+        super(CLineTestWorker, self).__init__(*args, **kwargs)
+        self.server_name = server_name
+        self.port = port
+        self.user = user
+        self.pw = pw
+        self.signals = CLineTestWorkerSignals()
 
     def run(self):
+        cline = str("C: %s %s %s %s" % (self.server_name, self.port, self.user, self.pw))
+
+        # Retrieve args/kwargs here; and fire processing using them
         try:
-            result = self.func(*self.args, **self.kwargs)
+            tester = CLineTester(cline)
+            error_msg = tester.test()
         except Exception as e:
-            print "ERROR: ", e
-            result = e
+            self.signals.error.emit(e)
+            error_msg = e.message
         finally:
-            if self.end_callback:
-                CallbackEvent.post_to(self.parent(), self.end_callback, result)
+            self.signals.finished.emit((self.server_name, self.port, self.user, self.pw), error_msg or '')
 
 
 class CLinesWindow(QtGui.QMainWindow):
+    """The GUI in which the user can paste clines, check if they work and get a hadu text.
+    """
 
     # regular expression used to find clines in user pasted text
     CLINE_REGEX = '^[Cc]{1}[:]{1}[ \t]+([^ \t]+)[ \t]+([0-9]+)[ \t]+([^ \t]+)[ \t]+([^ \t]+)'
-    TEST_DELAY = 0.2
+
+    # If you want invalid clines to show in the final hadu list, commented or not, set ON_INVALID_CLINES
+    # among the following:
+    INVALID_CLINES_EXCLUDE = 'exclude'
+    INVALID_CLINES_COMMENT = 'comment'
+    INVALID_CLINES_DO_NOTHING = 'no'
+    ON_INVALID_CLINES = INVALID_CLINES_EXCLUDE
 
     def __init__(self):
         QtGui.QMainWindow.__init__(self)
@@ -82,6 +94,8 @@ class CLinesWindow(QtGui.QMainWindow):
         self._clines_textarea = None
         self._c_widget = None
         self._hadu_textarea = None
+        self._n_tested = 0
+        self.servers_to_test = {}
 
         # Drawing window stuff
         self.resize(640, 480)
@@ -100,6 +114,14 @@ class CLinesWindow(QtGui.QMainWindow):
         self.widget.setLayout(self.layout)
         self.setCentralWidget(self.widget)
 
+        # PROGRESS BAR
+        self.progress_bar = QtGui.QProgressBar(self)
+        self.progress_bar.setAlignment(QtCore.Qt.AlignCenter)
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.layout.addWidget(self.progress_bar)
+        self.progress_bar.hide()
+
         # BUTTONS
         self.button_box = QtGui.QDialogButtonBox(self)
         self.button_box.setGeometry(QtCore.QRect(10, 480, 461, 32))
@@ -111,16 +133,8 @@ class CLinesWindow(QtGui.QMainWindow):
         self.button_ok, self.button_cancel = self.button_box.buttons()
         self.button_cancel.setText('Back')
         self.button_cancel.setDisabled(True)
-        self.button_ok.connect(
-            self.button_box,
-            QtCore.SIGNAL(_fromUtf8("accepted()")),
-            self.__next_page
-        )
-        self.button_cancel.connect(
-            self.button_box,
-            QtCore.SIGNAL(_fromUtf8("rejected()")),
-            self.__prev_page
-        )
+        self.button_ok.clicked.connect(self.__next_page)
+        self.button_cancel.clicked.connect(self.__prev_page)
         self.layout.addWidget(self.button_box)
 
         # Current page
@@ -129,8 +143,7 @@ class CLinesWindow(QtGui.QMainWindow):
         self.page1()
 
     def page1(self):
-        """This page contains a textarea where the user can paste
-        CLines to be tested and converted.
+        """This page contains a textarea where the user can paste CLines to be tested and converted.
         """
 
         self.setWindowTitle(u"CCCAM - Paste CLines")
@@ -155,9 +168,11 @@ class CLinesWindow(QtGui.QMainWindow):
         self.stacked_widget.insertWidget(0, self._clines_textarea)
 
     def clean_line(self, line):
-        """Returns a string containing a CLine, stripped of extra spaces
-        and extra characters, i.e. '<server name> <port> <user> <pw>'
+        """Returns a string containing a CLine, stripped of extra spaces and extra characters.
+
+        I.e. '<server name> <port> <user> <pw>'
         """
+
         try:
             line = unicode(line).strip()
         except UnicodeEncodeError:
@@ -169,48 +184,13 @@ class CLinesWindow(QtGui.QMainWindow):
         # no valid CLine found in this string
         return None
 
-    def test_cline(self, server_name, port, user, pw, checkbox=None):
-        cline = str("C: %s %s %s %s" % (server_name, port, user, pw))
-        t = checkbox.text()
-
-        tester = ClineTester(cline)
-        error_msg = tester.test()
-
-        if error_msg is None:
-            # SUCCESS!
-            checkbox.setChecked(True)
-            checkbox.setText("%s  [OK]" % t)
-            return True
-
-        # Server testing has failed
-        checkbox.setChecked(False)
-        checkbox.setText("%s  [FAILED: %s]" % (t, error_msg))
-        return False
-
-    def test_cline_done(self, result):
-        # NOT USED
-        pass
-
-    def test_cline_async(self, server_name, port, user, pw, checkbox):
-        """Executes self.test_cline asynchronously, using a """
-        CLineTestThread(
-            self,
-            # the method to be asynchronously executed
-            self.test_cline,
-            # method to call when the above is done testing
-            self.test_cline_done,
-            # server data
-            server_name, port, user, pw,
-            # the checkbox, we need it to write the testing result in its label
-            checkbox
-        )
-
     def generate_checkboxes(self, clines):
         """Generates a list of checkboxes, one for each recognized CLine.
 
         The label describes the CLine and shows a message telling if testing on that server was successful or not,
         once testing (which is asynchronous) is done.
         """
+
         # Grouping clines by server name+port: pasted clines might contain mnay entries for the same server+port
         # with different usernames and passwords. We want to keep those entries
         # together.
@@ -234,10 +214,9 @@ class CLinesWindow(QtGui.QMainWindow):
                         self.stacked_widget
                     )
                     checkboxes.append(checkbox)
-                    time.sleep(self.TEST_DELAY)
 
-                    self.test_cline_async(
-                        server_name, port, user, pw, checkbox)
+                    self.servers_to_test[
+                        (server_name, port, user, pw)] = checkbox
 
                 i += 1
 
@@ -247,6 +226,7 @@ class CLinesWindow(QtGui.QMainWindow):
         """Parses the text pasted in the textarea, looking for valid CLines, stripping whitespaces, comments and
         other garbage.
         """
+
         clines = []
 
         for line in text.split('\n'):
@@ -262,10 +242,11 @@ class CLinesWindow(QtGui.QMainWindow):
     def page2(self):
         """List of found CLines, checkboxes to select lines to include.
         """
+
         self._checkboxes = []
         self.clines = []
 
-        self.setWindowTitle(u"CCCAM - Found servers")
+        self.setWindowTitle(u"CCCAM - Testing servers")
 
         if self._clines_textarea:
             self.stacked_widget.removeWidget(self._clines_textarea)
@@ -293,24 +274,95 @@ class CLinesWindow(QtGui.QMainWindow):
 
         self.stacked_widget.insertWidget(0, self._c_widget)
 
-    def convert_line(self, n, cLine, commented=False):
+        # Showing the progress bar, disabling the OK button until processing is finished
+        self.button_ok.setDisabled(True)
+        self.progress_bar.setMaximum(len(self.servers_to_test))
+        self.progress_bar.show()
+        self.progress_bar.setTextVisible(True)
+        self._update_progress_bar()
+
+        self.start_testing()
+
+    def start_testing(self):
+        """Tests all servers by using various thread workers (QRunnables) in a thread pool.
+
+        This way testing is done asynchronously, since some servers may take some time to answer, so the UI is
+        not blocked until the process is done and we can show a progress bar.
+
+        See:
+        https://martinfitzpatrick.name/article/multithreading-pyqt-applications-with-qthreadpool/
+        https://nikolak.com/pyqt-threading-tutorial/
+        """
+
+        # A thread pool is a thread automatically hadling various tasks.
+        self.threadpool = QThreadPool()
+        self._n_tested = 0
+
+        for data in self.servers_to_test:
+            worker = CLineTestWorker(*data)
+            # When each worker is done, `end_testing` is called.
+            worker.signals.finished.connect(self.end_testing)
+
+            # Executing the thread worker within the pool.
+            self.threadpool.start(worker)
+
+    def _update_progress_bar(self, value=0):
+        self.progress_bar.setValue(value)
+
+    def end_testing(self, server_data, error_msg=''):
+        """Callback method that handles each thread worker finishing testing, with success or not.
+
+        It updated the progress bar and the checkbox text with a success/failure message .
+        """
+        self._n_tested += 1
+        self._update_progress_bar(self._n_tested)
+
+        checkbox = self.servers_to_test[tuple(server_data)]
+        t = checkbox.text()
+
+        if error_msg:
+            # Server testing has failed
+            checkbox.setChecked(False)
+            checkbox.setText("%s  [FAILED: %s]" % (t, error_msg))
+        else:
+            # SUCCESS!
+            checkbox.setChecked(True)
+            checkbox.setText("%s  [OK]" % t)
+
+        if self._n_tested >= len(self.servers_to_test):
+            # All servers have been tested, enabling the ok button.
+            self.button_ok.setDisabled(False)
+
+    def cline_to_hadu_string(self, n, cline, invalid=False):
+        """Converts a cline tuple into a hadu plugin string.
+        e.g.
+        """
+
+        comment = ''
+        if invalid:
+            if self.ON_INVALID_CLINES == self.INVALID_CLINES_EXCLUDE:
+                return
+            elif self.ON_INVALID_CLINES == self.INVALID_CLINES_COMMENT:
+                comment = ';'
+
         text = "{comment}[Serv_{servname}]\n{comment}Server=CCCam:{server}"\
-               ":{port}:0:{user}:{pw}\n{comment}Active=1\n"
-        comment = ';' if commented else ''
-        server, port, user, pw = cLine
+               ":{port}:0:{user}:{pw}\n"
+        server, port, user, pw = cline
+
         self.hadu_lines.append(text.format(
             servname='%s_%s' % (n, slugify(server)), server=server, port=port,
             user=user, pw=pw, comment=comment
         ))
 
     def page3(self):
+        """Final page, showing valid clines in had format.
+        """
         self.setWindowTitle('CCCAM - Hadu lines')
 
         self.stacked_widget.removeWidget(self._c_widget)
 
         for i, checkbox in enumerate(self._checkboxes):
-            self.convert_line(i, self.clines[i],
-                              commented=not checkbox.isChecked())
+            self.cline_to_hadu_string(i, self.clines[i], invalid=not checkbox.isChecked())
 
         self._hadu_textarea = QtGui.QPlainTextEdit(self)
         self._hadu_textarea.setGeometry(QtCore.QRect(10, 20, 461, 451))
@@ -321,12 +373,14 @@ class CLinesWindow(QtGui.QMainWindow):
         self._hadu_textarea.selectAll()
 
         self.stacked_widget.insertWidget(0, self._hadu_textarea)
+        self.stacked_widget.setCurrentIndex(0)
 
     def __change_page(self):
         self.button_ok.show()
         self.button_ok.setDisabled(False)
         self.button_cancel.show()
         self.button_cancel.setDisabled(False)
+        self.progress_bar.hide()
 
         if self.page_index == 1:
             self.button_cancel.setDisabled(True)
